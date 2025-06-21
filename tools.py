@@ -1,6 +1,9 @@
 import dspy
 import subprocess
 import re
+import os
+import json
+from pathlib import Path
 
 # --- Jargon Definer Tool --- #
 
@@ -17,62 +20,134 @@ def define_jargon_term(term: str) -> str:
     Returns:
         str: A simple, one-sentence definition of the term.
     """
+    if not term or not term.strip():
+        return "Error: No term provided for definition"
+    
     try:
         if not dspy.settings.lm:
             return "Error: DSPy Language Model not configured. Cannot define jargon."
+        
         predictor = dspy.Predict(_DefineJargonSignature)
-        response = predictor(term=term)
-        return str(response.simple_definition)
+        response = predictor(term=term.strip())
+        
+        if hasattr(response, 'simple_definition') and response.simple_definition:
+            return str(response.simple_definition).strip()
+        else:
+            return f"Could not generate definition for '{term}'"
+            
     except Exception as e:
         return f"Error defining term '{term}': {str(e)}"
 
-# --- Wikipedia Fetcher Tool --- #
+# --- Cache Management --- #
+
+def _get_cache_path():
+    """Get the cache directory path."""
+    cache_dir = Path.home() / ".eli5_cache"
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir
+
+def _get_cached_content(cache_key: str) -> str:
+    """Retrieve cached content if it exists."""
+    cache_file = _get_cache_path() / f"{cache_key}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+                return data.get('content', '')
+        except:
+            pass
+    return ""
+
+def _cache_content(cache_key: str, content: str):
+    """Cache content to disk."""
+    cache_file = _get_cache_path() / f"{cache_key}.json"
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump({'content': content}, f)
+    except:
+        pass
+
+def _safe_wikipedia_fetch(topic: str, wiki_type: str = 'simple', max_retries: int = 2) -> str:
+    """Safely fetch Wikipedia content with retries and caching."""
+    cache_key = f"{wiki_type}_{topic.lower().replace(' ', '_')}"
+    
+    # Check cache first
+    cached = _get_cached_content(cache_key)
+    if cached and not cached.startswith("Error"):
+        return cached
+    
+    # Try fetching with retries
+    for attempt in range(max_retries):
+        try:
+            py_command = (
+                f"import wikipediaapi; "
+                f"wiki = wikipediaapi.Wikipedia('MyEli5Agent/1.0', '{wiki_type}'); "
+                f"page = wiki.page('{topic}'); "
+                f"print(page.summary[:1500] if page.exists() else 'Topic not found on {wiki_type} Wikipedia.')"
+            )
+            result = subprocess.run(
+                ["python", "-c", py_command],
+                capture_output=True, text=True, check=True, timeout=25
+            )
+            content = result.stdout.strip()
+            
+            # Cache successful results
+            if content and not content.startswith("Topic not found"):
+                _cache_content(cache_key, content)
+            
+            return content
+            
+        except subprocess.TimeoutExpired:
+            if attempt < max_retries - 1:
+                continue
+            return f"Error: Wikipedia fetch timed out for '{topic}' after {max_retries} attempts"
+        except Exception as e:
+            if attempt < max_retries - 1:
+                continue
+            return f"Error fetching from {wiki_type} Wikipedia for '{topic}': {str(e)}"
+    
+    return f"Error: Failed to fetch '{topic}' after {max_retries} attempts"
+
+# --- Intelligent Wikipedia Fetcher Tool --- #
 
 def fetch_wikipedia_summary(topic: str) -> str:
-    """Fetches the introduction summary of a Wikipedia article for a given topic. Limits summary to approx 1500 chars.
+    """Intelligently fetches Wikipedia content, trying Simple English first, then regular Wikipedia.
+    Includes caching and retry logic for reliability.
+    
     Args:
         topic (str): The topic to search for on Wikipedia.
     Returns:
-        str: The summary of the Wikipedia article, or an error message if not found or an issue occurs.
+        str: The best available Wikipedia summary, or an error message.
     """
-    try:
-        py_command = (
-            f"import wikipediaapi; "
-            f"wiki = wikipediaapi.Wikipedia('MyEli5Agent/1.0', 'en'); "
-            f"page = wiki.page('{topic}'); "
-            f"print(page.summary[:1500] if page.exists() else 'Topic not found on Wikipedia.')"
-        )
-        result = subprocess.run(
-            ["python", "-c", py_command],
-            capture_output=True, text=True, check=True, timeout=20
-        )
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error fetching from Wikipedia for '{topic}': {str(e)}"
+    # Try Simple English Wikipedia first (better for ELI5)
+    simple_result = _safe_wikipedia_fetch(topic, 'simple')
+    
+    # If Simple Wikipedia has content, use it
+    if simple_result and not simple_result.startswith("Topic not found") and not simple_result.startswith("Error"):
+        return f"[Simple Wikipedia] {simple_result}"
+    
+    # Fall back to regular Wikipedia
+    regular_result = _safe_wikipedia_fetch(topic, 'en')
+    
+    if regular_result and not regular_result.startswith("Topic not found") and not regular_result.startswith("Error"):
+        return f"[Wikipedia] {regular_result}"
+    
+    # If both failed, return the most informative error
+    if "not found" in simple_result and "not found" in regular_result:
+        return f"Topic '{topic}' not found on either Simple or regular Wikipedia. Try a different topic or check spelling."
+    
+    return f"Error accessing Wikipedia for '{topic}'. Please try again later."
 
-# --- Simple Wikipedia Fetcher Tool --- #
+# --- Legacy Simple Wikipedia Tool (kept for compatibility) --- #
 
 def fetch_simple_wikipedia_summary(topic: str) -> str:
-    """Fetches the introduction summary of a Simple English Wikipedia article for a given topic. Limits summary to approx 1500 chars.
+    """Fetches only Simple English Wikipedia. Use fetch_wikipedia_summary() for intelligent selection.
     Args:
         topic (str): The topic to search for on Simple English Wikipedia.
     Returns:
         str: The summary of the Simple English Wikipedia article, or an error message.
     """
-    try:
-        py_command = (
-            f"import wikipediaapi; "
-            f"wiki = wikipediaapi.Wikipedia('MyEli5Agent/1.0', 'simple'); "
-            f"page = wiki.page('{topic}'); "
-            f"print(page.summary[:1500] if page.exists() else 'Topic not found on Simple Wikipedia.')"
-        )
-        result = subprocess.run(
-            ["python", "-c", py_command],
-            capture_output=True, text=True, check=True, timeout=20
-        )
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error fetching from Simple Wikipedia for '{topic}': {str(e)}"
+    return _safe_wikipedia_fetch(topic, 'simple')
 
 # --- Readability Checker Tool --- #
 
@@ -83,14 +158,24 @@ def get_readability_scores(text_to_check: str) -> str:
     Returns:
         str: A summary of the readability score, e.g., 'Flesch-Kincaid Grade Level: 8.5'.
     """
+    if not text_to_check or not text_to_check.strip():
+        return "Error: No text provided for readability check"
+    
     try:
         py_command = "import sys; import textstat; text = sys.stdin.read(); print(f'Flesch-Kincaid Grade Level: {textstat.flesch_kincaid_grade(text)}')"
         result = subprocess.run(
             ["python", "-c", py_command],
             input=text_to_check,
-            capture_output=True, text=True, check=True, timeout=10
+            capture_output=True, text=True, check=True, timeout=15
         )
-        return result.stdout.strip()
+        output = result.stdout.strip()
+        if not output:
+            return "Error: No readability score calculated"
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: Readability check timed out"
+    except subprocess.CalledProcessError as e:
+        return f"Error calculating readability: {e.stderr.strip() if e.stderr else 'Unknown error'}"
     except Exception as e:
         return f"Error checking readability: {str(e)}"
 
@@ -103,14 +188,32 @@ def preprocess_text(raw_text: str) -> str:
     Returns:
         str: The text after removing specified artifacts and normalizing whitespace.
     """
+    if not raw_text:
+        return "Error: No text provided for preprocessing"
+    
     try:
-        text = raw_text
-        text = re.sub(r'\[\d+\]', '', text)
-        text = re.sub(r'\[edit\]', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s*\(listen\)\s*', ' ', text, flags=re.IGNORECASE)
+        text = str(raw_text)
+        
+        # Remove Wikipedia-specific artifacts
+        text = re.sub(r'\[\d+\]', '', text)  # Remove citation numbers [1], [2], etc.
+        text = re.sub(r'\[edit\]', '', text, flags=re.IGNORECASE)  # Remove [edit] links
+        text = re.sub(r'\s*\(listen\)\s*', ' ', text, flags=re.IGNORECASE)  # Remove (listen) audio links
+        
+        # Remove citation needed and similar parenthetical notes
         text = re.sub(r'\s*\([^)]*\b(?:e\.g\.|i\.e\.|etc\.|cit\.(?:\s*needed)?|citation needed|[\w\s]*\d+:\d+)[^)]*\)\s*', ' ', text, flags=re.IGNORECASE)
+        
+        # Remove empty parentheses
         text = re.sub(r'\(\s*\)', ' ', text)
+        
+        # Remove source prefixes if present
+        text = re.sub(r'^\[(?:Simple )?Wikipedia\]\s*', '', text)
+        
+        # Normalize whitespace
         text = re.sub(r'\s+', ' ', text).strip()
+        
+        if not text:
+            return "Error: Text became empty after preprocessing"
+            
         return text
     except Exception as e:
         return f"Error during preprocessing: {str(e)}"
@@ -149,31 +252,23 @@ def generate_simple_example(concept: str, topic: str) -> str:
     Returns:
         A string containing one or two simple, concrete, factual examples of the topic.
     """
+    if not topic or not topic.strip():
+        return "Error: No topic provided for example generation"
+    
     try:
-        # Ensure DSPy is configured
         if not dspy.settings.lm:
-            # Fallback or minimal configuration if not already set
-            # This is a safeguard; ideally, configuration is done globally once.
-            print("Warning: DSPy LM not configured. Attempting fallback configuration for ExampleGeneratorTool.")
-            # Attempt to configure with a default or previously set model if possible
-            # This part might need adjustment based on how global config is handled
-            # For now, assuming it might have been configured elsewhere or raising an error
-            # if no lm is available, dspy.Predict will fail anyway.
+            return "Error: DSPy Language Model not configured. Cannot generate examples."
 
         predictor = dspy.Predict(FactualExampleGeneratorSignature)
-        # Handle potential API errors or unexpected LLM responses
-        result = predictor(concept=concept, topic=topic)
+        result = predictor(concept=concept or "", topic=topic.strip())
+        
         if hasattr(result, 'factual_instances_of_topic') and result.factual_instances_of_topic:
-            return result.factual_instances_of_topic
+            return str(result.factual_instances_of_topic).strip()
         else:
-            # Fallback if the LLM doesn't produce a valid example
-            print(f"Warning: ExampleGeneratorTool for concept '{concept}' and topic '{topic}' did not receive a valid example from LLM. Returning a placeholder.")
-            return f"Imagine you are learning about {topic}. One cool thing is {concept}. For instance, think about how that works in everyday life!"
+            return f"Could not generate specific examples for '{topic}'. Try asking about a more common topic."
 
     except Exception as e:
-        print(f"Error in ExampleGeneratorTool for concept '{concept}', topic '{topic}': {e}")
-        # Provide a generic fallback example in case of any error
-        return f"Let's think about {topic}. We know that {concept}. For example, you can see this when... (oops, I need to think of a better example!)"
+        return f"Error generating examples for '{topic}': {str(e)}"
 
 # --- Analogy Generator Tool --- #
 
@@ -189,11 +284,20 @@ def generate_analogy(concept: str) -> str:
     Returns:
         str: A simple, one-sentence analogy.
     """
+    if not concept or not concept.strip():
+        return "Error: No concept provided for analogy generation"
+    
     try:
         if not dspy.settings.lm:
             return "Error: DSPy Language Model not configured. Cannot generate analogy."
+        
         predictor = dspy.Predict(_GenerateAnalogySignature)
-        response = predictor(concept=concept)
-        return str(response.analogy)
+        response = predictor(concept=concept.strip())
+        
+        if hasattr(response, 'analogy') and response.analogy:
+            return str(response.analogy).strip()
+        else:
+            return f"Could not generate analogy for '{concept}'"
+            
     except Exception as e:
         return f"Error generating analogy for '{concept}': {str(e)}"
